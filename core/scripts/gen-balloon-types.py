@@ -25,7 +25,7 @@ Environment variables:
                 /sys/devices/system/node/node*/cpu*/topology/physical_package_id
 
   MAX_TP        optional, maximum tensor parallelism level to generate balloon
-                types for. The default is 4. Note that tp2, tp4 and tp8 balloons
+                types for. The default is 8. Note that tp2, tp4 and tp8 balloons
                 will not be generated unless there are at least 2, 4 or 8 NUMA
                 nodes in the system (or PKG_NODE corresponding to a system).
 
@@ -50,10 +50,10 @@ import sys
 # balloon_name is the base name for -tp1, -tp2 and -tp4 balloon types.
 balloon_name = os.getenv("VLLM_BALLOON_NAME", "vllm-balloon")
 
-# balloon_type_common are common attributes to be included in all
+# vllm_balloon_type_common are common attributes to be included in all
 # -tp1, -tp2 and -tp4 balloons. "|" denotes the indentation level of
 # the "balloonTypes" element in balloons policy configuration.
-balloon_type_common = """
+vllm_balloon_type_common = """
 |  preferNewBalloons: true
 |  pinMemory: false
 """
@@ -110,13 +110,36 @@ def optimize_gnr3tile(pkg_node):
                 pkg = sorted(pkg_node)[pkg_idx]
                 yield (pkg, node)
 
-def generate_balloon_types(pkg_node, max_tp):
+def generate_node_balloon_types(pkg_node):
+    # Generate base balloon types for allocating CPUs on each NUMA
+    # node separately with "pkg<P>node<N>" balloons, and from all NUMA
+    # nodes on each package with "pkg<P>nodes" balloons.
+    node_balloon_types = []
+    for pkg in pkg_node:
+        for node in pkg_node[pkg]:
+            node_balloon_types.append(f"""
+            |- name: pkg{pkg}node{node}
+            |  preferCloseToDevices:
+            |  - /sys/devices/system/node/node{node}
+            """)
+        node_balloon_types.append(f"""
+        |- name: pkg{pkg}nodes
+        |  componentCreation: all
+        |  components:
+        """)
+        for node in pkg_node[pkg]:
+            node_balloon_types.append(f"""
+            |  - balloonType: pkg{pkg}node{node}
+            """)
+    return node_balloon_types
+
+def generate_vllm_balloon_types(pkg_node, max_tp):
+    # Generate balloon types for vllms with varying tensor
+    # parallelisms up to max_tp.
     node_pkg = {}
     for pkg in pkg_node:
         for node in pkg_node[pkg]:
             node_pkg[node] = pkg
-
-    node_balloon_types = []
 
     tp1_balloon_types = []
 
@@ -129,23 +152,12 @@ def generate_balloon_types(pkg_node, max_tp):
     tp8_balloon_types = []
     tp8_balloon_names = []
 
-    # Add base balloon types for allocating CPUs on each NUMA node.
-    # "|" in the beginning of each *_balloon_type line indicates the
-    # indention level of "balloonTypes" in balloons policy yaml.
-    for pkg in pkg_node:
-        for node in pkg_node[pkg]:
-            node_balloon_types.append(f"""
-            |- name: pkg{pkg}node{node}
-            |  preferCloseToDevices:
-            |  - /sys/devices/system/node/node{node}
-            """)
-
     # Generate -tp1 balloon type that is balanced across all NUMA nodes
     # and packages.
     if max_tp >= 1:
         tp1_balloon_types.append(f"""
         |- name: {balloon_name}-tp1
-        {balloon_type_common}
+        {vllm_balloon_type_common}
         |  componentCreation: balance-balloons
         |  components:
         """)
@@ -197,7 +209,7 @@ def generate_balloon_types(pkg_node, max_tp):
         if tp2_balloon_names:
             tp2_balloon_types.append(f"""
             |- name: {balloon_name}-tp2
-            {balloon_type_common}
+            {vllm_balloon_type_common}
             |  componentCreation: balance-balloons
             |  components:
             """)
@@ -294,7 +306,7 @@ def generate_balloon_types(pkg_node, max_tp):
 
         tp4_balloon_types.append(f"""
         |- name: {balloon_name}-tp4
-        {balloon_type_common}
+        {vllm_balloon_type_common}
         |  componentCreation: balance-balloons
         |  components:
         """)
@@ -332,7 +344,7 @@ def generate_balloon_types(pkg_node, max_tp):
 
         tp8_balloon_types.append(f"""
         |- name: {balloon_name}-tp8
-        {balloon_type_common}
+        {vllm_balloon_type_common}
         |  componentCreation: balance-balloons
         |  components:
         """)
@@ -341,24 +353,48 @@ def generate_balloon_types(pkg_node, max_tp):
             |  - balloonType: {name}
             """)
 
+    return tp1_balloon_types + tp2_balloon_types + tp4_balloon_types + tp8_balloon_types
 
-    balloon_types = []
-    for lines in node_balloon_types + tp1_balloon_types + tp2_balloon_types + tp4_balloon_types + tp8_balloon_types:
-        for line in lines.splitlines():
-            if line.strip().startswith("|"):
-                balloon_types.append(line.strip()[1:])
-    return balloon_types
+def generate_builtin_balloon_types(pkg_node):
+    # Generate one "default" balloon on each package.
+    # These balloons takes equally many CPUs from every NUMA
+    # node in the package in order to leave as many CPUs per node
+    # free as possible for vllm balloons.
+    builtin_balloon_types = [f"""
+    |- name: "default"
+    |  namespaces:
+    |  - "*"
+    |  - kube-system
+    |  minBalloons: {len(pkg_node)}
+    |  minCPUs: 1
+    |  componentCreation: balance-balloons
+    |  components:
+    """]
+    for pkg in pkg_node:
+        builtin_balloon_types.append(f"""
+        |  - balloonType: pkg{pkg}nodes
+        """)
+    builtin_balloon_types.append(f"""
+    |- name: "reserved"
+
+    """)
+    return builtin_balloon_types
+
+def discover_topology():
+    pkg_node = {}
+    for node_dir in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
+        for pkg_id_file in glob.glob(node_dir + "/cpu[0-9]*/topology/physical_package_id"):
+            pkg = int(open(pkg_id_file).read())
+            node = int(node_dir.split("node/node")[1])
+            if not pkg in pkg_node:
+                pkg_node[pkg] = []
+            pkg_node[pkg].append(node)
+            break # no need to read pkg_id of other cpus from the same node
+    return pkg_node
 
 if __name__ == "__main__":
-    pkg_node = {}
-    if os.getenv("PKG_NODE", None):
-        try:
-            pkg_node = ast.literal_eval(os.getenv("PKG_NODE"))
-        except Exception as e:
-            error(f"failed to evaluate pkg_node dictionary from PKG_NODE: {e}")
-
     try:
-        max_tp = int(os.getenv("MAX_TP", "4"))
+        max_tp = int(os.getenv("MAX_TP", "8"))
     except Exception as e:
         error(f"failed to parse MAX_TP value: {e}, expected 1, 2, 4 or 8")
 
@@ -367,16 +403,26 @@ if __name__ == "__main__":
     except Exception as e:
         error(f"failed to parse INDENT value: {e}")
 
+    pkg_node = {}
+    if os.getenv("PKG_NODE", None):
+        try:
+            pkg_node = ast.literal_eval(os.getenv("PKG_NODE"))
+        except Exception as e:
+            error(f"failed to evaluate pkg_node dictionary from PKG_NODE: {e}")
     if not pkg_node:
-        for node_dir in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
-            for pkg_id_file in glob.glob(node_dir + "/cpu[0-9]*/topology/physical_package_id"):
-                pkg = int(open(pkg_id_file).read())
-                node = int(node_dir.split("node/node")[1])
-                if not pkg in pkg_node:
-                    pkg_node[pkg] = []
-                pkg_node[pkg].append(node)
-                break # no need to read pkg_id of other cpus from the same node
+        pkg_node = discover_topology()
 
-    balloon_types = [(" " * indent) + line for line in generate_balloon_types(pkg_node, max_tp)]
+    balloon_types = []
+    balloon_types.extend(generate_node_balloon_types(pkg_node))
+    balloon_types.extend(generate_vllm_balloon_types(pkg_node, max_tp))
+    balloon_types.extend(generate_builtin_balloon_types(pkg_node))
 
-    print("\n".join(balloon_types))
+    # Post-process balloon_types by replacing "|" with selected
+    # indentation level and removing empty lines.
+    pp_balloon_types = []
+    for section in balloon_types:
+        for line in section.splitlines():
+            if line.strip().startswith("|"):
+                pp_balloon_types.append((" " * indent) + line.strip()[1:])
+
+    print("\n".join(pp_balloon_types))
